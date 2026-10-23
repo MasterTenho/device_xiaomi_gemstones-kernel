@@ -1,53 +1,503 @@
-# Copyright (C) 2025 chickendrop89
+name: "Build XStock-NoKSU"
 
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# Remove the "xxx source code.tar.gz" artifacts from sourceforge 
-# after a release as i noticed some people downloading it accidentally
-# and complaining that the kernel zip can not be flashed.
-
-name: SourceForge Cleanup
+env:
+  OUT_DIR: "out"
+  KERNEL_VERSION: "5.15"
+  ANDROID_VERSION: "13"
 
 on:
-  release:
-    types: [published, edited]
+  schedule:
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  delete_source_code_artifacts:
+  build-kernels:
+    name: "🐎 Build XStock ${{ matrix.kernel.name }} kernel"
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          - name: "GKI-NoKSU"
+            dir: "common_gki_noksu"
+            repo_name: "common"
+            repo_url: "https://android.googlesource.com/kernel/common"
+            branch: "android13-5.15-lts"
+            defconfig: "gki_defconfig"
+            local_version: "-XStock-GKI"
+            output_name: "Image.gki.noksu"
+            enable_ksu: false
+            extra_patches:
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-gki-fixup.patch"
+              - "https://raw.githubusercontent.com/yougotme101/kernel_patches/main/0001-scripts-sign-builds.patch"
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-Don-t-append-and-dirty-to-localversion.patch"
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-do-not-ship-full-auto_localversion.patch"
+          - name: "CLO-NoKSU"
+            dir: "common_clo_noksu"
+            repo_name: "clo"
+            repo_url: "https://git.codelinaro.org/clo/la/kernel/msm-5.15.git"
+            branch: "kernel.lnx.5.15.r1-rel"
+            defconfig: "gki_defconfig"
+            local_version: "-XStock-CLO"
+            output_name: "Image.clo.noksu"
+            enable_ksu: false
+            extra_patches:
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-gki-fixup.patch"
+              - "https://raw.githubusercontent.com/yougotme101/kernel_patches/main/0001-scripts-sign-builds.patch"
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-Don-t-append-and-dirty-to-localversion.patch"
+              - "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-scripts-do-not-ship-full-auto_localversion.patch"
+
+    env:
+      KERNEL_LOC_DIR: ${{ matrix.kernel.dir }}
+      KERNEL_NAME: ${{ matrix.kernel.repo_name }}
+      KERNEL_REPO: ${{ matrix.kernel.repo_url }}
+      KERNEL_BRANCH: ${{ matrix.kernel.branch }}
+      DEFCONFIG_NAME: ${{ matrix.kernel.defconfig }}
+      LOCAL_VERSION: ${{ matrix.kernel.local_version }}
+      OUTPUT_NAME: ${{ matrix.kernel.output_name }}
+      WORK_DIR: ${{ github.workspace }}
+
     steps:
-      - name: Delete source code artifacts from SourceForge
-        env:
-          SF_API_COOKIE: ${{ secrets.SF_API_COOKIE }}
-          SF_PROJECT_NAME: ${{ secrets.SF_PROJECT_NAME }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          SF_RELEASE_PATH: "files"
+      - name: "✨ Setup workspace"
         run: |
-          sleep 120
+          mkdir -p ${{ env.KERNEL_LOC_DIR }}
+          echo "BUILD_TIME=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          # gcc-aarch64-linux-gnu y autotools son necesarios para compilar memtool estático
+          sudo apt-get install -y repo rsync aria2 jq gcc-aarch64-linux-gnu autoconf automake
 
-          echo "Attempting to delete 'source code' artifacts for release ${{ env.RELEASE_TAG }}..."
-          BASE_URL="https://sourceforge.net/projects/${{ env.SF_PROJECT_NAME }}/${{ env.SF_RELEASE_PATH }}/${{ env.RELEASE_TAG }}"
+      - name: 🔍 Check Space (Before Cleanup)
+        run: df -h /
 
-          SOURCE_TAR_GZ_NAME="chickernel_%20${{ env.RELEASE_TAG }}%20release%20source%20code.tar.gz"
-          SOURCE_ZIP_NAME="chickernel_%20${{ env.RELEASE_TAG }}%20release%20source%20code.zip"
+      - name: 🧹 Aggressive Cleanup
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force
+          sudo docker builder prune -a -f
 
-          echo "Deleting file: ${SOURCE_TAR_GZ_NAME}"
-          curl -s -H "Accept: application/json" -X DELETE \
-               -b "sourceforge=${{ env.SF_API_COOKIE }}" \
-               "${BASE_URL}/${SOURCE_TAR_GZ_NAME}" || true
-          
-          echo "Deleting file: ${SOURCE_ZIP_NAME}"
-          curl -s -H "Accept: application/json" -X DELETE \
-               -b "sourceforge=${{ env.SF_API_COOKIE }}" \
-               "${BASE_URL}/${SOURCE_ZIP_NAME}" || true
+      - name: 📐 Setup SWAP 14GB
+        uses: pierotofy/set-swap-space@master
+        with:
+            swap-size-gb: 14
 
-          echo
-          echo "Delete request sent. Source code artifacts should be removed from SourceForge."
+      - name: 📐 Tune Swap
+        run: |
+            echo "vm.swappiness=80" | sudo tee -a /etc/sysctl.conf
+            sudo sysctl -p
+
+      - name: "🌟 Clone kernel source"
+        working-directory: ./${{ env.KERNEL_LOC_DIR }}
+        run: |
+          git clone --recursive --branch ${{ env.KERNEL_BRANCH }} \
+            ${{ env.KERNEL_REPO }} ${{ env.KERNEL_NAME }} --depth=1
+
+      - name: "📡 Apply mac80211 injection patch"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          curl -L -o injection.patch \
+            "https://github.com/dabao1955/kernel_build_action/raw/main/nethunter/add-wifi-injection.patch"
+          git apply injection.patch || echo "::warning::El parche de inyección no se aplicó, revisa el log"
+
+      - name: "📥 Initialize AOSP repo and toolchains"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android13-5.15-lts --depth=1
+          repo sync --optimized-fetch --prune -j8
+
+          rm -rf .repo common
+
+          aria2c -x 16 -s 16 -o prebuilts/clang/host/linux-x86/clang-r614150.tar.gz "https://github.com/yougotme101/clang/releases/download/v1.0.2/clang-r614150.tar.gz"
+          mkdir -p prebuilts/clang/host/linux-x86/clang-r614150
+          tar -xzf prebuilts/clang/host/linux-x86/clang-r614150.tar.gz -C prebuilts/clang/host/linux-x86/clang-r614150
+          rm -rf prebuilts/clang/host/linux-x86/clang-r614150.tar.gz
+
+          rm -rf prebuilts/clang/host/linux-x86/clang-3289846 \
+                 prebuilts/clang/host/linux-x86/clang-r450784e \
+                 prebuilts/clang/host/linux-x86/clang-r547379 \
+                 prebuilts/clang/host/linux-x86/clang-r584948b \
+                 prebuilts/clang/host/linux-x86/clang-r596125 \
+                 prebuilts/clang/host/linux-x86/clang-stable
+
+          sed -i \
+           -e 's/^BRANCH=.*/BRANCH=android13-5.15/' \
+           -e 's/^CLANG_VERSION=.*/CLANG_VERSION=r614150/' \
+           ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.constants
+
+          sed -i '/^POST_DEFCONFIG_CMDS="check_defconfig"/d' ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki || true
+
+      - name: "🧩 Configure kernel & patches"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          echo "CONFIG_LOCALVERSION=\"${{ env.LOCAL_VERSION }}-${{ env.BUILD_TIME }}\"" >> "$CONFIG_FILE"
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> "$CONFIG_FILE"
+
+          apply_patch() {
+            local url="$1"
+            local file=$(basename "$url")
+            curl -L -o "$file" "$url"
+            patch -p1 < "$file" || echo "::warning::Hunks failed in $file"
+            rm -f "$file"
+          }
+
+          apply_patch "https://raw.githubusercontent.com/topnotchfreaks/kernel_patches/main/0001-gki-fixup.patch"
+
+          echo '${{ toJSON(matrix.kernel.extra_patches) }}' | jq -r '.[]' | while read p; do
+            [ -n "$p" ] && apply_patch "$p"
+          done
+
+          echo "CONFIG_KALLSYMS=y" >> "$CONFIG_FILE"
+
+          # Optimizaciones base para Redmi Note 13 4G
+          echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TCP_CONG_BIC=n" >> "$CONFIG_FILE"
+          echo "CONFIG_TCP_CONG_WESTWOOD=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TCP_CONG_HTCP=n" >> "$CONFIG_FILE"
+          echo "CONFIG_TCP_CONG_BBR=y" >> "$CONFIG_FILE"
+          echo "CONFIG_DEFAULT_BBR=y" >> "$CONFIG_FILE"
+          echo "CONFIG_OVERLAY_FS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TMPFS_XATTR=y" >> "$CONFIG_FILE"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$CONFIG_FILE"
+          echo "CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y" >> "$CONFIG_FILE"
+          echo "CONFIG_PM_WAKELOCKS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_PM_WAKELOCKS_LIMIT=100" >> "$CONFIG_FILE"
+          echo "CONFIG_PM_WAKELOCKS_GC=y" >> "$CONFIG_FILE"
+          echo "CONFIG_SUSPEND=y" >> "$CONFIG_FILE"
+          echo "CONFIG_SUSPEND_FREEZER=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_GZIP is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_LZO is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_XZ is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_ZSTD is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_BZIP2 is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_KERNEL_UNCOMPRESSED is not set" >> "$CONFIG_FILE"
+          sed -i '/ZRAM_DEF_COMP_LZO/d' "$CONFIG_FILE"
+          echo "CONFIG_CRYPTO_LZ4=y" >> "$CONFIG_FILE"
+          echo "CONFIG_KERNEL_LZ4=y" >> "$CONFIG_FILE"
+          echo "ZRAM_DEF_COMP_LZ4=y" >> "$CONFIG_FILE"
+
+          # memtool support: habilita /dev/mem
+          echo "CONFIG_DEVMEM=y" >> "$CONFIG_FILE"
+          echo "# CONFIG_STRICT_DEVMEM is not set" >> "$CONFIG_FILE"
+          echo "# CONFIG_IO_STRICT_DEVMEM is not set" >> "$CONFIG_FILE"
+
+      - name: '⚙️ Inject Reflex Governor'
+        shell: bash
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p kernel/sched
+          curl -sL -o kernel/sched/cpufreq_reflex.c \
+            "https://raw.githubusercontent.com/kusonekoworld-max/KonekoKernel-GKI/refs/heads/main/.github/actions/build-kernel/patches/reflex/cpufreq_reflex.c"
+
+          if ! grep -q "cpufreq_reflex.o" "kernel/sched/Makefile"; then
+            echo 'obj-$(CONFIG_CPU_FREQ_GOV_REFLEX) += cpufreq_reflex.o' >> "kernel/sched/Makefile"
+          fi
+
+          if ! grep -q "config CPU_FREQ_GOV_REFLEX" "drivers/cpufreq/Kconfig"; then
+            printf "\nconfig CPU_FREQ_GOV_REFLEX\n" >> "drivers/cpufreq/Kconfig"
+            printf "\ttristate \"'reflex' cpufreq governor\"\n" >> "drivers/cpufreq/Kconfig"
+            printf "\tdepends on CPU_FREQ && SMP\n" >> "drivers/cpufreq/Kconfig"
+            printf "\tselect CPU_FREQ_GOV_ATTR_SET\n" >> "drivers/cpufreq/Kconfig"
+            printf "\thelp\n" >> "drivers/cpufreq/Kconfig"
+            printf "\t  'reflex' is an advanced CPU frequency governor based on schedutil,\n" >> "drivers/cpufreq/Kconfig"
+            printf "\t  featuring idle-time accounting and PELT-complementary exponential decay.\n" >> "drivers/cpufreq/Kconfig"
+          fi
+
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          if [ -f "$CONFIG_FILE" ] && ! grep -q "CONFIG_CPU_FREQ_GOV_REFLEX" "$CONFIG_FILE"; then
+            echo "CONFIG_CPU_FREQ_GOV_REFLEX=y" >> "$CONFIG_FILE"
+          fi
+
+      - name: 'Inject Vorpal Governor + GKI510 Compat'
+        shell: bash
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          set -euo pipefail
+          mkdir -p kernel/sched
+          curl -sL -o kernel/sched/cpufreq_vorpal.c \
+            "https://raw.githubusercontent.com/yougotme101/KonekoKernel-GKI/refs/heads/main/.github/actions/build-kernel/patches/vorpal/cpufreq_vorpal.c"
+          curl -sL -o kernel/sched/rfx_gki510_compat.c \
+            "https://raw.githubusercontent.com/yougotme101/KonekoKernel-GKI/refs/heads/main/.github/actions/build-kernel/patches/vorpal/rfx_gki510_compat.c"
+
+          if ! grep -q "cpufreq_vorpal.o" "kernel/sched/Makefile"; then
+            echo 'obj-$(CONFIG_CPU_FREQ_GOV_VORPAL) += cpufreq_vorpal.o' >> "kernel/sched/Makefile"
+          fi
+          if ! grep -q "rfx_gki510_compat.o" "kernel/sched/Makefile"; then
+            echo 'obj-y += rfx_gki510_compat.o' >> "kernel/sched/Makefile"
+          fi
+
+          if ! grep -q "config CPU_FREQ_GOV_VORPAL" "drivers/cpufreq/Kconfig"; then
+            printf "\nconfig CPU_FREQ_GOV_VORPAL\n" >> "drivers/cpufreq/Kconfig"
+            printf "\ttristate \"'vorpal' cpufreq governor\"\n" >> "drivers/cpufreq/Kconfig"
+            printf "\tdepends on CPU_FREQ && SMP\n" >> "drivers/cpufreq/Kconfig"
+            printf "\tselect CPU_FREQ_GOV_ATTR_SET\n" >> "drivers/cpufreq/Kconfig"
+            printf "\thelp\n" >> "drivers/cpufreq/Kconfig"
+            printf "\t  'vorpal' is a schedutil-based governor tuned for\n" >> "drivers/cpufreq/Kconfig"
+            printf "\t  gaming/thermal-aware dual-profile operation.\n" >> "drivers/cpufreq/Kconfig"
+          fi
+
+          CONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG_NAME }}"
+          if [ -f "$CONFIG_FILE" ] && ! grep -q "CONFIG_CPU_FREQ_GOV_VORPAL" "$CONFIG_FILE"; then
+            echo "CONFIG_CPU_FREQ_GOV_VORPAL=y" >> "$CONFIG_FILE"
+          fi
+
+      - name: 'Fix Vorpal Input-Handler Init Bug'
+        shell: bash
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          set -euo pipefail
+          VORPAL_C="kernel/sched/cpufreq_vorpal.c"
+          if ! grep -q "bool input_ok;" "$VORPAL_C"; then
+           perl -0pi -e 's{(static int __init vorpal_gov_init\(void\)\n\{\n\tint ret;\n)}{$1\tbool input_ok;\n}' "$VORPAL_C"
+          fi
+          if ! grep -q "input_ok = !input_register_handler" "$VORPAL_C"; then
+            perl -0pi -e 's{\tif \(input_register_handler\(&rfx_input_handler\)\)\n\t\tpr_warn\("vorpal: input handler register failed \(touch boost off\)\\n"\);}{\tinput_ok = !input_register_handler(&rfx_input_handler);\n\tif (!input_ok)\n\t\tpr_warn("vorpal: input handler register failed (touch boost off)\\n");}' "$VORPAL_C"
+          fi
+          if ! grep -q "if (input_ok)" "$VORPAL_C"; then
+            perl -0pi -e 's{\tret = cpufreq_register_governor\(&vorpal_gov\);\n\tif \(ret\) \{\n\t\tinput_unregister_handler\(&rfx_input_handler\);\n\t\tcancel_delayed_work_sync\(&rfx_thermal_work\);\n\t\}}{\tret = cpufreq_register_governor(&vorpal_gov);\n\tif (ret) \{\n\t\tif (input_ok)\n\t\t\tinput_unregister_handler(&rfx_input_handler);\n\t\tcancel_delayed_work_sync(&rfx_thermal_work);\n\t\}}' "$VORPAL_C"
+          fi
+          for MARK in "bool input_ok;" "input_ok = !input_register_handler" "if (input_ok)"; do
+            if ! grep -qF "$MARK" "$VORPAL_C"; then
+              echo "ERROR: missing marker in vorpal_gov_init(): $MARK" >&2
+              exit 1
+            fi
+          done
+
+      - name: 'Inject Vorpal Gaming-Mode Bias into fair.c'
+        shell: bash
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          set -euo pipefail
+          FAIR_C="kernel/sched/fair.c"
+          if ! grep -q "extern int sched_gaming_active;" "$FAIR_C"; then
+            perl -0pi -e 's{(static unsigned int normalized_sysctl_sched_latency\s*=\s*6000000ULL;)}{$1\n\nextern int sched_gaming_active;\n\n#define GAMING_VRUNTIME_STRETCH\t\t4\n}' "$FAIR_C"
+          fi
+          if ! grep -q "GAMING_VRUNTIME_STRETCH - 1" "$FAIR_C"; then
+            perl -0pi -e 's{(\tcurr->vruntime \+= calc_delta_fair\(delta_exec, curr\);\n)(\tupdate_min_vruntime\(cfs_rq\);\n)}{$1\n\tif (unlikely(sched_gaming_active \&\& !entity_is_task(curr))) {\n\t\tcurr->vruntime += calc_delta_fair(delta_exec * (GAMING_VRUNTIME_STRETCH - 1), curr);\n\t} else if (unlikely(sched_gaming_active \&\& entity_is_task(curr) \&\&\n\t\t\t     curr->avg.load_avg < 100)) {\n\t\tcurr->vruntime += calc_delta_fair(delta_exec, curr);\n\t}\n$2}' "$FAIR_C"
+          fi
+          if ! grep -q "ideal_runtime / 2" "$FAIR_C"; then
+            perl -0pi -e 's{(\tdelta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;\n)(\ttrace_android_rvh_check_preempt_tick)}{$1\n\tif (unlikely(sched_gaming_active) \&\& entity_is_task(curr)) {\n\t\tstruct task_struct *p = task_of(curr);\n\n\t\tif (p->static_prio > DEFAULT_PRIO \&\&\n\t\t    delta_exec > ideal_runtime / 2)\n\t\t\tresched_curr(rq_of(cfs_rq));\n\t}\n\n$2}' "$FAIR_C"
+          fi
+          if ! grep -q "NSEC_PER_MSEC" "$FAIR_C"; then
+            perl -0pi -e 's{(\tfor_each_sched_entity\(se\) \{\n\t\tcfs_rq = cfs_rq_of\(se\);\n\n)(\t\tupdate_load_avg\(cfs_rq, se, UPDATE_TG\);\n\t\tse_update_runnable\(se\);\n\t\tupdate_cfs_group\(se\);)}{$1\t\tif (unlikely(sched_gaming_active \&\& entity_is_task(se) \&\&\n\t\t\t     task_of(se)->static_prio <= DEFAULT_PRIO))\n\t\t\tse->vruntime -= min_t(u64, se->vruntime, NSEC_PER_MSEC);\n\n$2}' "$FAIR_C"
+          fi
+          if ! grep -q "Gaming task isolation" "$FAIR_C"; then
+            perl -0pi -e 's{(\tdelta = rq_clock_task\(env->src_rq\) - p->se\.exec_start;\n\n)(\treturn delta < \(s64\)sysctl_sched_migration_cost;\n\}\n)}{$1\t/* Gaming task isolation */\n\tif (sched_gaming_active) {\n\t\tif (capacity_orig_of(env->dst_cpu) < capacity_orig_of(env->src_cpu) \&\&\n\t\t    task_util(p) > (capacity_orig_of(env->src_cpu) >> 3))\n\t\t\treturn 1;\n\t\treturn delta < (s64)sysctl_sched_migration_cost * 2;\n\t}\n\n$2}' "$FAIR_C"
+          fi
+          for MARK in "extern int sched_gaming_active;" "GAMING_VRUNTIME_STRETCH - 1" "ideal_runtime / 2" "NSEC_PER_MSEC" "Gaming task isolation"; do
+            if ! grep -qF "$MARK" "$FAIR_C"; then
+              echo "ERROR: failed to inject fair.c gaming patch, missing marker: $MARK" >&2
+              exit 1
+            fi
+          done
+
+      - name: "🚀 Add Droidspaces Support (fix KABI sysvipc)"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          curl -sL "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" | git apply -v --ignore-whitespace || echo "::warning::Droidspaces patch skipped/failed"
+
+      - name: "🔧 Add NoMount Support"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/maxsteeel/nomount/refs/heads/dev/kernel/setup.sh" | bash -
+
+      - name: "📝 Append custom Makefile line"
+        working-directory: ${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}
+        run: |
+         echo 'KBUILD_CFLAGS += -Wno-implicit-function-declaration' >> Makefile
+
+      - name: "🔨 Build kernel"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          LTO=full \
+          BUILD_CONFIG=${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }}/build.config.gki.aarch64 \
+          build/build.sh -j$(nproc --all)
+
+      - name: "📡 Build RTL8812AU driver (monitor + injection)"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          set -e
+          git clone --depth=1 -b v5.6.4.2 https://github.com/aircrack-ng/rtl8812au.git rtl8812au-src
+          cd rtl8812au-src
+          sed -i 's/CONFIG_PLATFORM_I386_PC = y/CONFIG_PLATFORM_I386_PC = n/g' Makefile
+          sed -i 's/CONFIG_PLATFORM_ARM64_RPI = n/CONFIG_PLATFORM_ARM64_RPI = y/g' Makefile
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               KSRC=${{ env.WORK_DIR }}/${{ env.KERNEL_LOC_DIR }}/${{ env.KERNEL_NAME }} \
+               -j$(nproc) || {
+            echo "::warning::Falló la compilación del driver RTL8812AU"
+            exit 0
+          }
+          find . -name "*.ko" -exec cp {} "${{ env.WORK_DIR }}/" \;
+          echo "✅ Driver RTL8812AU compilado"
+
+      - name: "🔧 Build memtool (static)"
+        working-directory: ${{ env.WORK_DIR }}
+        run: |
+          set -e
+          echo "📦 Cloning memtool..."
+          git clone --depth=1 https://github.com/ensc/memtool.git memtool-src || \
+            { echo "❌ Failed to clone memtool"; exit 1; }
+
+          cd memtool-src
+
+          echo "🔧 Generating configure script with autoreconf..."
+          autoreconf -fi
+
+          echo "⚙️ Configuring for static aarch64 build..."
+          ./configure --host=aarch64-linux-gnu CC=aarch64-linux-gnu-gcc CFLAGS="-static -O2"
+
+          echo "🔨 Building static memtool..."
+          make
+
+          if [ ! -f memtool ]; then
+            echo "❌ memtool binary not found"
+            exit 1
+          fi
+
+          file memtool
+          cp memtool "${{ env.WORK_DIR }}/memtool"
+          echo "✅ memtool built and copied to workspace"
+
+      - name: "📁 Copy Vanilla kernel image"
+        if: matrix.kernel.enable_ksu == false
+        working-directory: ${{ env.WORK_DIR }}/out/dist
+        run: |
+          cp Image "${{ env.OUTPUT_NAME }}"
+
+      - name: "📤 Upload kernel artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.kernel.name }}-kernel
+          path: ${{ env.WORK_DIR }}/out/dist/${{ env.OUTPUT_NAME }}
+          retention-days: 1
+
+      - name: "📤 Upload memtool artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: memtool-${{ matrix.kernel.name }}
+          path: ${{ env.WORK_DIR }}/memtool
+          retention-days: 1
+
+      - name: 🔍 Check Space (Post-Build)
+        if: always()
+        run: |
+          echo "Final disk space status:"
+          df -h /
+
+  package-kernels:
+    name: "📦 Package Kernels"
+    runs-on: ubuntu-latest
+    needs: [build-kernels]
+    steps:
+      - name: "📥 Download kernel artifacts"
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts/
+
+      - name: "📦 Create release package"
+        run: |
+          set -e
+          git clone --depth=1 https://github.com/yougotme101/AnyKernel3 -b YASK AnyKernel3
+          find ./artifacts -name "Image.*" -exec cp {} AnyKernel3/ \;
+
+          # Copiar memtool al ZIP si existe
+          MEMTOOL_BIN=$(find ./artifacts -name "memtool" -type f | head -n 1)
+          if [ -n "$MEMTOOL_BIN" ] && [ -f "$MEMTOOL_BIN" ]; then
+            cp "$MEMTOOL_BIN" AnyKernel3/memtool
+            chmod +x AnyKernel3/memtool
+            echo "✅ memtool incluido en el ZIP"
+          else
+            echo "::warning::memtool no encontrado en los artefactos"
+          fi
+
+          # Copiar driver WiFi si existe
+          DRIVER_KO=$(find ./artifacts -name "*.ko" -type f | head -n 1)
+          if [ -n "$DRIVER_KO" ] && [ -f "$DRIVER_KO" ]; then
+            cp "$DRIVER_KO" AnyKernel3/
+            echo "✅ Driver incluido en el ZIP: $(basename $DRIVER_KO)"
+          else
+            echo "::warning::No se encontró driver .ko, el ZIP no incluirá inyección WiFi"
+          fi
+
+          cat > AnyKernel3/banner << 'EOF'
+          ╔═════════════════════════════════════════════════════╗
+          ║                     XStock Kernel                   ║
+          ║                   by @yougotme101                   ║
+          ║              Powered by Github Actions              ║
+          ╠═════════════════════════════════════════════════════╣
+          ║     Features:                                       ║
+          ║     • Full LTO + -O2 Optimization                   ║
+          ║     • Extra TCP Congestion                          ║
+          ║     • AOSP clang-r614150                            ║
+          ║     • Droidspaces Support                           ║
+          ║     • Vanilla (No-KSU)                              ║
+          ║     • Metamodule & NoMount Support                  ║
+          ║     • memtool (static, CONFIG_DEVMEM)               ║
+          ╚═════════════════════════════════════════════════════╝
+          Installing XStock Kernel...
+          EOF
+
+          ZIP_NAME="AK3_XStock-AIO-FULL_NOKSU_$(date +'%Y-%m-%d').zip"
+          cd AnyKernel3
+          zip -r9 "../$ZIP_NAME" * -x .git/*
+          cd ..
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+
+      - name: "⬆️ Upload to GitHub Release"
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ZIP_NAME }}
+          tag_name: "XStock-NoKSU"
+          generate_release_notes: true
+
+      - name: "🎉 Send Telegram success notification"
+        run: |
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/XStock-NoKSU"
+          BANNER_URL="https://raw.githubusercontent.com/yougotme101/kernel_msm-5.15/builder/assets/xeniel.png"
+          if [[ "${{ job.status }}" == "success" ]]; then
+            MESSAGE="✅ *XStock Kernel Released*
+
+          📦 *Build Information:*
+          • Kernel: \`Linux 5.15\`
+          • Android: \`13-17\`
+          • Base: \`GKI & CLO\`
+          • KSU: \`No\`
+          • LTO: \`Full\`
+          • Optimization: \`-O2\`
+          • Droidspaces: \`Enabled\`
+          • NoMount: \`Enabled\`
+          • memtool: \`Included (static)\`
+
+          📱 *Supported Devices:*
+          • Redmi Note 12 4G/NFC
+          • Redmi Note 13 4G/NFC
+          • Redmi Pad SE
+
+          🕐 *Build Date:* $(date '+%Y-%m-%d %H:%M:%S UTC')
+          📦 *Package:* \`${{ env.ZIP_NAME }}\`
+
+          ⬇️ [Download Here]($RELEASE_URL)"
+            curl -s -X POST \
+              -d chat_id=${{ secrets.TELEGRAM_USER_ID }} \
+              -d photo="${BANNER_URL}" \
+              --data-urlencode "caption=${MESSAGE}" \
+              -d parse_mode="Markdown" \
+              -d disable_web_page_preview="false" \
+              "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendPhoto"
+          else
+            FAILURE_MSG="❌ *XStock Kernel Build Failed*
+
+          🕐 *Failed at:* $(date '+%Y-%m-%d %H:%M:%S UTC')
+
+          🔍 Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
+            curl -s -X POST \
+              -d chat_id=${{ secrets.TELEGRAM_USER_ID }} \
+              -d photo="${BANNER_URL}" \
+              --data-urlencode "caption=${FAILURE_MSG}" \
+              -d parse_mode="Markdown" \
+              "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendPhoto"
+          fi
